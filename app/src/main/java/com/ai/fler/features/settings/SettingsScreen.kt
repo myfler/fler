@@ -1,5 +1,6 @@
 package com.ai.fler.features.settings
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,10 +18,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.NewReleases
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Update
 import androidx.compose.material.icons.filled.Warning
@@ -164,6 +168,7 @@ fun SettingsScreen(
                     onInstallRuntime = { engineViewModel.installRuntimeLibs() },
                     onInstallSelected = { engineViewModel.installSelectedVersion() },
                     onSelectVersion = { engineViewModel.selectVersion(it) },
+                    onCancelDownload = { engineViewModel.cancelDownload() },
                     onDownloadUpdate = { engineViewModel.installRuntimeLibs(force = true) },
                     onDownloadAll = { engineViewModel.downloadAllEngines() },
                 )
@@ -268,9 +273,12 @@ private fun EngineVersionCard(
     onInstallRuntime: () -> Unit,
     onInstallSelected: () -> Unit,
     onSelectVersion: (String) -> Unit,
+    onCancelDownload: () -> Unit,
     onDownloadUpdate: () -> Unit,
     onDownloadAll: () -> Unit,
 ) {
+    var showUpdateConfirm by remember { mutableStateOf(false) }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -290,6 +298,63 @@ private fun EngineVersionCard(
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f)
                 )
+
+                engineState.manifest?.packVersion?.let { packVersion ->
+                    val hasUpdate = engineState.installedPackVersion != null &&
+                        engineState.installedPackVersion != packVersion
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (hasUpdate) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        border = BorderStroke(
+                            width = 1.dp,
+                            color = if (hasUpdate) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.outlineVariant
+                            }
+                        )
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Cloud,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                                tint = if (hasUpdate) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                }
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = packVersion,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (hasUpdate) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                }
+                            )
+                            if (hasUpdate) {
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Icon(
+                                    imageVector = Icons.Default.NewReleases,
+                                    contentDescription = "有新版可用",
+                                    modifier = Modifier.size(14.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
 
                 if (engineState.loadingManifest) {
                     CircularProgressIndicator(
@@ -333,16 +398,49 @@ private fun EngineVersionCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     installedVersions.forEach { version ->
+                        val isUpdateable = version in engineState.updateableVersions
                         Surface(
                             shape = RoundedCornerShape(8.dp),
-                            color = MaterialTheme.colorScheme.secondaryContainer
+                            color = if (isUpdateable) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.secondaryContainer
+                            },
+                            border = if (isUpdateable) {
+                                BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                            } else {
+                                null
+                            }
                         ) {
-                            Text(
-                                text = "Dart $version",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                            )
+                            ) {
+                                Icon(
+                                    imageVector = if (isUpdateable) {
+                                        Icons.Default.NewReleases
+                                    } else {
+                                        Icons.Default.Check
+                                    },
+                                    contentDescription = null,
+                                    modifier = Modifier.size(12.dp),
+                                    tint = if (isUpdateable) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSecondaryContainer
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = if (isUpdateable) "Dart $version · 可更新" else "Dart $version",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isUpdateable) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSecondaryContainer
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -415,23 +513,38 @@ private fun EngineVersionCard(
                 EngineVersionDropdown(
                     engines = manifest.engines,
                     installedVersions = installedVersions,
+                    updateableVersions = engineState.updateableVersions,
                     selectedVersion = engineState.selectedVersion,
                     enabled = !engineState.isDownloading && !engineState.isDownloadingAll,
                     onSelect = onSelectVersion,
                 )
 
                 val selectedInstalled = engineState.selectedVersion?.let { installedVersions.contains(it) } == true
-                val canInstall = engineState.selectedVersion != null && !selectedInstalled
+                val selectedUpdateable = engineState.selectedVersion?.let {
+                    it in engineState.updateableVersions
+                } == true
+                val canInstall = engineState.selectedVersion != null &&
+                    (!selectedInstalled || selectedUpdateable)
                 Spacer(modifier = Modifier.height(8.dp))
                 Button(
-                    onClick = onInstallSelected,
-                    enabled = canInstall && !engineState.isDownloading && !engineState.isDownloadingAll,
+                    onClick = {
+                        if (engineState.isDownloading) {
+                            onCancelDownload()
+                        } else if (selectedUpdateable) {
+                            showUpdateConfirm = true
+                        } else {
+                            onInstallSelected()
+                        }
+                    },
+                    enabled = (canInstall && !engineState.isDownloading && !engineState.isDownloadingAll) ||
+                        engineState.isDownloading,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
                         when {
-                            engineState.isDownloading -> "下载中..."
+                            engineState.isDownloading -> "取消下载"
                             engineState.isDownloadingAll -> "正在批量下载..."
+                            selectedUpdateable -> "更新 Dart ${engineState.selectedVersion}"
                             selectedInstalled -> "已安装 Dart ${engineState.selectedVersion}"
                             engineState.selectedVersion != null -> "下载 Dart ${engineState.selectedVersion}"
                             else -> "请选择版本"
@@ -439,17 +552,30 @@ private fun EngineVersionCard(
                     )
                 }
 
-                // 一键下载全部（存在未安装版本时可用）
-                val pendingCount = manifest.engines.count { it.dartVersion !in installedVersions }
+                // 一键下载全部（存在未安装版本或可更新版本时可用）
+                val pendingCount = manifest.engines.count {
+                    it.dartVersion !in installedVersions || it.dartVersion in engineState.updateableVersions
+                }
                 if (pendingCount > 0) {
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(
-                        onClick = onDownloadAll,
-                        enabled = !engineState.isDownloading && !engineState.isDownloadingAll,
+                        onClick = {
+                            if (engineState.isDownloadingAll) {
+                                onCancelDownload()
+                            } else {
+                                onDownloadAll()
+                            }
+                        },
+                        enabled = (!engineState.isDownloading && !engineState.isDownloadingAll) ||
+                            engineState.isDownloadingAll,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Download,
+                            imageVector = if (engineState.isDownloadingAll) {
+                                Icons.Default.Close
+                            } else {
+                                Icons.Default.Download
+                            },
                             contentDescription = null,
                             modifier = Modifier.size(18.dp),
                         )
@@ -457,7 +583,7 @@ private fun EngineVersionCard(
                         Text(
                             when {
                                 engineState.isDownloadingAll ->
-                                    "下载全部引擎中 (${engineState.progress?.batchCompleted ?: 0}/${engineState.progress?.batchTotal ?: pendingCount})"
+                                    "取消下载全部"
                                 else -> "下载全部引擎（缺 $pendingCount 个）"
                             }
                         )
@@ -639,6 +765,32 @@ private fun EngineVersionCard(
             )
         }
     }
+
+    // 更新确认对话框
+    if (showUpdateConfirm) {
+        AlertDialog(
+            onDismissRequest = { showUpdateConfirm = false },
+            title = { Text("更新引擎") },
+            text = {
+                Text("将重新下载 Dart ${engineState.selectedVersion} 并覆盖安装。确定继续？")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showUpdateConfirm = false
+                        onInstallSelected()
+                    }
+                ) {
+                    Text("更新", color = MaterialTheme.colorScheme.primary)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdateConfirm = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -646,12 +798,14 @@ private fun EngineVersionCard(
 private fun EngineVersionDropdown(
     engines: List<com.ai.fler.core.service.EngineEntry>,
     installedVersions: List<String>,
+    updateableVersions: Set<String>,
     selectedVersion: String?,
     enabled: Boolean,
     onSelect: (String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selectedInstalled = selectedVersion?.let { installedVersions.contains(it) } == true
+    val selectedUpdateable = selectedVersion?.let { it in updateableVersions } == true
     val selectedEntry = engines.firstOrNull { it.dartVersion == selectedVersion }
 
     ExposedDropdownMenuBox(
@@ -676,6 +830,7 @@ private fun EngineVersionDropdown(
         ) {
             engines.forEach { entry ->
                 val isInstalled = installedVersions.contains(entry.dartVersion)
+                val isUpdateable = entry.dartVersion in updateableVersions
                 val isSelected = entry.dartVersion == selectedVersion
                 DropdownMenuItem(
                     text = {
@@ -689,6 +844,20 @@ private fun EngineVersionDropdown(
                                 modifier = Modifier.weight(1f)
                             )
                             when {
+                                isUpdateable -> {
+                                    Icon(
+                                        imageVector = Icons.Default.NewReleases,
+                                        contentDescription = "可更新",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Text(
+                                        text = "可更新",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+
                                 isInstalled -> {
                                     Icon(
                                         imageVector = Icons.Default.CheckCircle,
@@ -730,12 +899,14 @@ private fun EngineVersionDropdown(
     ) {
         Text(
             text = when {
+                selectedUpdateable -> "Dart $selectedVersion 有新版可更新，点击「更新」覆盖安装"
                 selectedInstalled -> "Dart $selectedVersion 已安装，无需下载"
                 selectedEntry != null -> "Dart $selectedVersion 尚未安装，可下载"
                 else -> "选择版本后即可下载"
             },
             style = MaterialTheme.typography.labelSmall,
             color = when {
+                selectedUpdateable -> MaterialTheme.colorScheme.primary
                 selectedInstalled -> MaterialTheme.colorScheme.tertiary
                 selectedEntry != null -> MaterialTheme.colorScheme.onSurfaceVariant
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -750,6 +921,7 @@ private fun phaseLabel(phase: com.ai.fler.core.service.EnginePackManager.EngineP
     com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.EXTRACTING -> "解压中"
     com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.LOADING -> "加载中"
     com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.COMPLETED -> "完成"
+    com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.CANCELLED -> "已取消"
     com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.FAILED -> "失败"
     com.ai.fler.core.service.EnginePackManager.EngineProgress.Phase.IDLE -> "等待中"
 }

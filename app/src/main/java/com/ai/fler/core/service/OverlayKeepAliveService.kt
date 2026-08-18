@@ -147,10 +147,13 @@ class OverlayKeepAliveService : Service() {
     @SuppressLint("ClickableViewAccessibility")
     private fun showMenu() {
         val lp = ensureParams()
-        if (!isMenuMode) isMenuMode = true
-        // 记录球体当前位置，菜单布局用的 clampPosition 不得污染球体锚点
-        lastBallX = lp.x
-        lastBallY = lp.y
+        // 仅首次从球体展开时记录球体锚点；refreshMenu 复用时不更新，
+        // 否则 lp.x/lp.y 已是菜单坐标，会把锚点污染成菜单位置导致收起后球体跑偏
+        if (!isMenuMode) {
+            isMenuMode = true
+            lastBallX = lp.x
+            lastBallY = lp.y
+        }
 
         val mcpRunning = mcpServerManager.isRunning()
         val patchEnabled = config.patchEnabled.value

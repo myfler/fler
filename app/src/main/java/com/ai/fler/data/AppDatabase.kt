@@ -5,6 +5,7 @@ import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import com.ai.fler.data.dao.AddressMappingDao
 import com.ai.fler.data.dao.AnalysisDao
+import com.ai.fler.data.dao.AsmBlockDao
 import com.ai.fler.data.dao.DartCallGraphDao
 import com.ai.fler.data.dao.DartClassDao
 import com.ai.fler.data.dao.DartMethodDao
@@ -17,6 +18,7 @@ import com.ai.fler.data.dao.PpEntryDao
 import com.ai.fler.data.dao.ProjectDao
 import com.ai.fler.data.entity.AddressMapping
 import com.ai.fler.data.entity.Analysis
+import com.ai.fler.data.entity.AsmBlock
 import com.ai.fler.data.entity.DartCallEdge
 import com.ai.fler.data.entity.DartClass
 import com.ai.fler.data.entity.DartMethod
@@ -47,9 +49,10 @@ import com.ai.fler.data.entity.Project
         McpToolStat::class,
         HookScript::class,
         DartObject::class,
-        EnumMap::class
+        EnumMap::class,
+        AsmBlock::class
     ],
-    version = 10,
+    version = 11,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -76,6 +79,9 @@ abstract class AppDatabase : RoomDatabase() {
 
     /** 枚举索引映射 DAO（引擎 enum_map 表）。 */
     abstract fun enumMapDao(): EnumMapDao
+
+    /** ASM 反汇编块 DAO（Blutter asm 完整产物）。 */
+    abstract fun asmBlockDao(): AsmBlockDao
 
     /**
      * 级联删除项目及其所有关联数据。
@@ -108,6 +114,7 @@ abstract class AppDatabase : RoomDatabase() {
             libraryDao().deleteByAnalysisId(analysis.id)
             dartObjectDao().deleteByAnalysisId(analysis.id)
             enumMapDao().deleteByAnalysisId(analysis.id)
+            asmBlockDao().deleteByAnalysisId(analysis.id)
         }
 
         // 2. 删 analyses
@@ -146,6 +153,7 @@ abstract class AppDatabase : RoomDatabase() {
         libraryDao().deleteByAnalysisId(analysisId)
         dartObjectDao().deleteByAnalysisId(analysisId)
         enumMapDao().deleteByAnalysisId(analysisId)
+        asmBlockDao().deleteByAnalysisId(analysisId)
         analysisDao().deleteById(analysisId)
     }
 

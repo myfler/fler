@@ -6,6 +6,7 @@ import com.ai.fler.core.service.EngineManifest
 import com.ai.fler.core.service.EnginePackManager
 import com.ai.fler.core.service.EngineSourceConfig
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -33,6 +34,8 @@ class EngineViewModel @Inject constructor(
     data class EngineUiState(
         val isReady: Boolean = false,
         val isRuntimeReady: Boolean = false,
+        val installedPackVersion: String? = null,
+        val updateableVersions: Set<String> = emptySet(),
         val progress: EnginePackManager.EngineProgress? = null,
         val isDownloading: Boolean = false,
         val isDownloadingAll: Boolean = false,
@@ -47,16 +50,27 @@ class EngineViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(EngineUiState())
     val uiState: StateFlow<EngineUiState> = _uiState.asStateFlow()
 
+    /** 当前进行中的下载 Job（取消下载用）。 */
+    private var downloadJob: Job? = null
+
     init {
         checkEngineStatus()
         loadManifest()
-        // 引擎版本变化（下载完成/清除）时实时刷新就绪状态
+        // 引擎版本变化（下载完成/清除）时实时刷新就绪状态与可更新列表
         viewModelScope.launch {
             enginePackManager.versionsEpoch.collect {
+                val current = _uiState.value
+                val manifestPack = current.manifest?.packVersion
                 _uiState.update {
                     it.copy(
                         isReady = enginePackManager.isEnginePackReady(),
                         isRuntimeReady = enginePackManager.isRuntimeReady(),
+                        installedPackVersion = enginePackManager.currentInstalledPackVersion(),
+                        updateableVersions = if (manifestPack != null) {
+                            enginePackManager.listUpdateableVersions(manifestPack).toSet()
+                        } else {
+                            emptySet()
+                        },
                     )
                 }
             }
@@ -84,11 +98,17 @@ class EngineViewModel @Inject constructor(
             _uiState.update { it.copy(loadingManifest = true, manifestError = null) }
             try {
                 val manifest = enginePackManager.fetchManifest()
+                val updateable = if (manifest != null) {
+                    enginePackManager.listUpdateableVersions(manifest.packVersion).toSet()
+                } else {
+                    emptySet()
+                }
                 _uiState.update {
                     it.copy(
                         manifest = manifest,
                         loadingManifest = false,
                         manifestError = if (manifest == null) "无法获取远程引擎清单" else null,
+                        updateableVersions = updateable,
                         selectedVersion = it.selectedVersion
                             ?: manifest?.engines?.firstOrNull()?.dartVersion,
                     )
@@ -119,9 +139,14 @@ class EngineViewModel @Inject constructor(
     fun installEngine(version: String) {
         if (_uiState.value.isDownloading || _uiState.value.isDownloadingAll) return
         _uiState.update { it.copy(isDownloading = true, errorMessage = null) }
-        viewModelScope.launch {
-            enginePackManager.installEngineVersion(version).collectLatest { progress ->
-                applyProgress(progress)
+        downloadJob?.cancel()
+        downloadJob = viewModelScope.launch {
+            try {
+                enginePackManager.installEngineVersion(version).collectLatest { progress ->
+                    applyProgress(progress)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 主动取消：状态已在 cancelDownload 中复位
             }
         }
     }
@@ -130,9 +155,14 @@ class EngineViewModel @Inject constructor(
     fun installRuntimeLibs(force: Boolean = false) {
         if (_uiState.value.isDownloading || _uiState.value.isDownloadingAll) return
         _uiState.update { it.copy(isDownloading = true, errorMessage = null) }
-        viewModelScope.launch {
-            enginePackManager.installRuntimeLibs(force).collectLatest { progress ->
-                applyProgress(progress)
+        downloadJob?.cancel()
+        downloadJob = viewModelScope.launch {
+            try {
+                enginePackManager.installRuntimeLibs(force).collectLatest { progress ->
+                    applyProgress(progress)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 主动取消：状态已在 cancelDownload 中复位
             }
         }
     }
@@ -144,10 +174,32 @@ class EngineViewModel @Inject constructor(
     fun downloadAllEngines() {
         if (_uiState.value.isDownloading || _uiState.value.isDownloadingAll) return
         _uiState.update { it.copy(isDownloadingAll = true, errorMessage = null) }
-        viewModelScope.launch {
-            enginePackManager.installAllEngines().collectLatest { progress ->
-                applyProgress(progress)
+        downloadJob?.cancel()
+        downloadJob = viewModelScope.launch {
+            try {
+                enginePackManager.installAllEngines().collectLatest { progress ->
+                    applyProgress(progress)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 主动取消：状态已在 cancelDownload 中复位
             }
+        }
+    }
+
+    /**
+     * 取消当前下载/安装流程（单个引擎或全部引擎）。
+     */
+    fun cancelDownload() {
+        enginePackManager.cancelDownloads()
+        downloadJob?.cancel()
+        downloadJob = null
+        _uiState.update {
+            it.copy(
+                isDownloading = false,
+                isDownloadingAll = false,
+                progress = null,
+                errorMessage = "下载已取消",
+            )
         }
     }
 
@@ -172,6 +224,16 @@ class EngineViewModel @Inject constructor(
                         isDownloadingAll = false,
                         isReady = enginePackManager.isEnginePackReady(),
                         isRuntimeReady = enginePackManager.isRuntimeReady(),
+                    )
+                }
+            }
+            EnginePackManager.EngineProgress.Phase.CANCELLED -> {
+                _uiState.update {
+                    it.copy(
+                        isDownloading = false,
+                        isDownloadingAll = false,
+                        progress = null,
+                        errorMessage = progress.errorMessage,
                     )
                 }
             }

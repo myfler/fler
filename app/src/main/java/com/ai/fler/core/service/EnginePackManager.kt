@@ -57,6 +57,10 @@ class EnginePackManager @Inject constructor(
         private const val TAG = "FlerEngine"
         private const val KEY_INSTALLED_PACK_VERSION = "installed_pack_version"
 
+        /** per-version 来源包版本记录前缀：engine_<dartVersion>_pack = v0.4.4 */
+        private const val KEY_ENGINE_PACK_PREFIX = "engine_"
+        private const val KEY_ENGINE_PACK_SUFFIX = "_pack"
+
         /** 下载+SHA256 校验的最大尝试次数（失败自动重试）。 */
         private const val MAX_DOWNLOAD_ATTEMPTS = 3
 
@@ -87,6 +91,7 @@ class EnginePackManager @Inject constructor(
             EXTRACTING,
             LOADING,
             COMPLETED,
+            CANCELLED,
             FAILED,
         }
 
@@ -101,12 +106,17 @@ class EnginePackManager @Inject constructor(
                 Phase.EXTRACTING -> 0.75f + extractProgress * 0.2f
                 Phase.LOADING -> 0.95f
                 Phase.COMPLETED -> 1.0f
+                Phase.CANCELLED -> 0f
                 Phase.FAILED -> 0f
             }
     }
 
     private val _progress = MutableStateFlow(EngineProgress(EngineProgress.Phase.IDLE))
     val progress: Flow<EngineProgress> = _progress.asStateFlow()
+
+    /** 取消下载请求标志：置位后正在进行的安装流程尽快中止。 */
+    @Volatile
+    private var cancelRequested = false
 
     /** 引擎版本变更信号：下载完成 / 清除后自增，供设置页等 UI 实时刷新已安装版本。 */
     private val _versionsEpoch = MutableStateFlow(0L)
@@ -117,6 +127,41 @@ class EnginePackManager @Inject constructor(
         get() = prefs().getString(KEY_INSTALLED_PACK_VERSION, null)
             ?: EngineSourceConfig.ENGINE_PACKAGE_VERSION
         set(value) = prefs().edit().putString(KEY_INSTALLED_PACK_VERSION, value).apply()
+
+    /** 当前已安装的引擎包版本（未装过时回退内置缺省版本）。 */
+    fun currentInstalledPackVersion(): String = installedPackVersion
+
+    /** 某 Dart 版本引擎的来源包版本记录（未安装过返回 null）。 */
+    fun getEngineInstalledPack(dartVersion: String): String? =
+        prefs().getString(KEY_ENGINE_PACK_PREFIX + dartVersion + KEY_ENGINE_PACK_SUFFIX, null)
+
+    private fun setEngineInstalledPack(dartVersion: String, packVersion: String) {
+        prefs().edit()
+            .putString(KEY_ENGINE_PACK_PREFIX + dartVersion + KEY_ENGINE_PACK_SUFFIX, packVersion)
+            .apply()
+    }
+
+    private fun clearEngineInstalledPack(dartVersion: String) {
+        prefs().edit().remove(KEY_ENGINE_PACK_PREFIX + dartVersion + KEY_ENGINE_PACK_SUFFIX).apply()
+    }
+
+    /**
+     * 清理当前 manifest 中已不存在的旧版本引擎文件（远程包移除某版本时残留）。
+     */
+    private fun cleanupStaleEngines(manifest: EngineManifest) {
+        val valid = manifest.engines.map { it.dartVersion }.toSet()
+        engineDir.listFiles()
+            ?.filter { it.name.startsWith("dartvm_") && it.name.endsWith(".so") }
+            ?.map { it.name.removePrefix("dartvm_").removeSuffix(".so") }
+            ?.filter { it !in valid }
+            ?.forEach { stale ->
+                val staleFile = File(engineDir, "dartvm_$stale.so")
+                if (staleFile.delete()) {
+                    clearEngineInstalledPack(stale)
+                    Log.i(TAG, "清理旧版本引擎文件: dartvm_$stale.so")
+                }
+            }
+    }
 
     private fun prefs() = context.getSharedPreferences("engine_pack", Context.MODE_PRIVATE)
 
@@ -156,9 +201,45 @@ class EnginePackManager @Inject constructor(
     }
 
     /**
+     * 判断指定 Dart 版本引擎是否需要更新（已安装 且 来源包版本落后于最新）。
+     *
+     * 未安装返回 false；已安装但无来源记录（旧版 App 装的）视为可更新。
+     */
+    fun isEngineUpdateable(dartVersion: String, currentPackVersion: String): Boolean {
+        if (!isEngineVersionReady(dartVersion)) return false
+        val source = getEngineInstalledPack(dartVersion)
+        return source != currentPackVersion
+    }
+
+    /**
+     * 列出已安装但来源包版本落后于 [currentPackVersion] 的可更新版本。
+     */
+    suspend fun listUpdateableVersions(currentPackVersion: String): List<String> =
+        withContext(Dispatchers.IO) {
+            listInstalledVersions().filter { isEngineUpdateable(it, currentPackVersion) }
+        }
+
+    /**
      * 获取远程引擎清单（manifest.json）。失败返回 null（网络/源配置问题）。
      */
     suspend fun fetchManifest(): EngineManifest? = downloader.fetchManifest()
+
+    /**
+     * 请求取消当前下载/安装流程。
+     *
+     * 置位取消标志并中断 okhttp Call；进行中的 [installEngineVersion] /
+     * [installAllEngines] / [installRuntimeLibs] 会在下载阶段尽快中止。
+     * 流程结束时由各入口复位标志。
+     */
+    fun cancelDownloads() {
+        cancelRequested = true
+        downloader.cancel()
+    }
+
+    /** 复位取消标志（下载入口启动时 / 流程结束时调用）。 */
+    private fun resetCancelFlag() {
+        cancelRequested = false
+    }
 
     // ========== 安装流程 ==========
 
@@ -170,6 +251,7 @@ class EnginePackManager @Inject constructor(
      * @param force 为 true 时强制重新下载（「下载更新」用），即使已就绪也重下。
      */
     fun installRuntimeLibs(force: Boolean = false): Flow<EngineProgress> = channelFlow {
+        resetCancelFlag()
         if (!force && isRuntimeReady()) {
             Log.i(TAG, "运行库已就绪，跳过下载")
             emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED))
@@ -196,6 +278,15 @@ class EnginePackManager @Inject constructor(
             Log.i(TAG, "运行库安装完成")
             appLogger.info(TAG, "运行库安装完成")
             emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            resetCancelFlag()
+            Log.i(TAG, "运行库下载已取消")
+            val err = EngineProgress(
+                phase = EngineProgress.Phase.CANCELLED,
+                errorMessage = "下载已取消",
+            )
+            _progress.value = err
+            send(err)
         } catch (e: Exception) {
             Log.e(TAG, "运行库安装失败: ${e.message}", e)
             appLogger.error(TAG, "运行库安装失败: ${e.message}")
@@ -214,17 +305,21 @@ class EnginePackManager @Inject constructor(
      * 运行库未就绪时先自动补装运行库（必装基线）。已安装则直接 COMPLETED 短路。
      */
     fun installEngineVersion(dartVersion: String): Flow<EngineProgress> = channelFlow {
-        if (isEngineVersionReady(dartVersion)) {
-            Log.i(TAG, "引擎 Dart $dartVersion 已就绪，跳过下载")
-            emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED))
-            return@channelFlow
-        }
-
+        resetCancelFlag()
         try {
             val manifest = downloader.fetchManifest()
                 ?: throw IllegalStateException("无法获取引擎清单 manifest.json（请检查下载源配置与网络）")
             val entry = manifest.engines.firstOrNull { it.dartVersion == dartVersion }
                 ?: throw IllegalStateException("远程清单中不存在 Dart $dartVersion 引擎")
+
+            // 已安装且来源包版本 == 当前最新 → 无需重下
+            if (isEngineVersionReady(dartVersion) &&
+                getEngineInstalledPack(dartVersion) == manifest.packVersion
+            ) {
+                Log.i(TAG, "引擎 Dart $dartVersion 已就绪且为最新，跳过下载")
+                emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED))
+                return@channelFlow
+            }
 
             // 运行库必装：缺失时先补装
             if (!isRuntimeReady()) {
@@ -244,10 +339,21 @@ class EnginePackManager @Inject constructor(
             }
 
             installedPackVersion = manifest.packVersion
+            setEngineInstalledPack(dartVersion, manifest.packVersion)
+            cleanupStaleEngines(manifest)
             notifyVersionsChanged()
-            Log.i(TAG, "引擎 Dart $dartVersion 安装完成")
+            Log.i(TAG, "引擎 Dart $dartVersion 安装完成（来源包 $manifest.packVersion）")
             appLogger.info(TAG, "引擎 Dart $dartVersion 安装完成")
             emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            resetCancelFlag()
+            Log.i(TAG, "引擎下载已取消: Dart $dartVersion")
+            val err = EngineProgress(
+                phase = EngineProgress.Phase.CANCELLED,
+                errorMessage = "下载已取消",
+            )
+            _progress.value = err
+            send(err)
         } catch (e: Exception) {
             Log.e(TAG, "引擎安装失败: ${e.message}", e)
             appLogger.error(TAG, "引擎安装失败: ${e.message}")
@@ -268,6 +374,7 @@ class EnginePackManager @Inject constructor(
      * 错误并继续下一个，最后汇总（COMPLETED 若至少成功一个，否则 FAILED）。
      */
     fun installAllEngines(): Flow<EngineProgress> = channelFlow {
+        resetCancelFlag()
         try {
             val manifest = downloader.fetchManifest()
                 ?: throw IllegalStateException("无法获取引擎清单 manifest.json（请检查下载源配置与网络）")
@@ -287,10 +394,12 @@ class EnginePackManager @Inject constructor(
                 engineLoader.ensureSharedLibsLoaded()
             }
 
-            // 需要安装的版本列表
+            // 需要安装/更新的版本列表（未装 或 来源包版本落后于最新）
             val pending = manifest.engines
                 .map { it.dartVersion }
-                .filter { !isEngineVersionReady(it) }
+                .filter {
+                    !isEngineVersionReady(it) || getEngineInstalledPack(it) != manifest.packVersion
+                }
             val total = pending.size
             if (total == 0) {
                 emitProgress(this, EngineProgress(EngineProgress.Phase.COMPLETED, batchTotal = total))
@@ -316,8 +425,11 @@ class EnginePackManager @Inject constructor(
                     if (!isEngineVersionReady(version)) {
                         throw IllegalStateException("引擎 Dart $version 安装后仍不可用")
                     }
+                    setEngineInstalledPack(version, manifest.packVersion)
                     completed++
                     Log.i(TAG, "批量下载：Dart $version 完成 ($completed/$total)")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     failed++
                     failedVersions.add(version)
@@ -326,6 +438,7 @@ class EnginePackManager @Inject constructor(
             }
 
             installedPackVersion = manifest.packVersion
+            cleanupStaleEngines(manifest)
             notifyVersionsChanged()
             Log.i(TAG, "批量下载结束: 成功 $completed/$total, 失败 $failed")
             appLogger.info(TAG, "批量下载引擎结束: 成功 $completed/$total")
@@ -352,6 +465,15 @@ class EnginePackManager @Inject constructor(
                     )
                 )
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            resetCancelFlag()
+            Log.i(TAG, "批量下载引擎已取消")
+            val err = EngineProgress(
+                phase = EngineProgress.Phase.CANCELLED,
+                errorMessage = "下载已取消",
+            )
+            _progress.value = err
+            send(err)
         } catch (e: Exception) {
             Log.e(TAG, "批量下载引擎失败: ${e.message}", e)
             appLogger.error(TAG, "批量下载引擎失败: ${e.message}")
@@ -391,6 +513,13 @@ class EnginePackManager @Inject constructor(
      */
     suspend fun clearEngines() = withContext(Dispatchers.IO) {
         engineDir.deleteRecursively()
+        // 清理全部 per-version 来源记录 + 包级版本
+        val editor = prefs().edit()
+        prefs().all.keys
+            .filter { it.startsWith(KEY_ENGINE_PACK_PREFIX) && it.endsWith(KEY_ENGINE_PACK_SUFFIX) }
+            .forEach { editor.remove(it) }
+        editor.remove(KEY_INSTALLED_PACK_VERSION)
+        editor.apply()
         notifyVersionsChanged()
     }
 
@@ -482,6 +611,11 @@ class EnginePackManager @Inject constructor(
                     _progress.value = p
                     scope.trySend(p)
                 }
+                // 下载完成但已被请求取消 → 中止
+                if (cancelRequested) {
+                    Log.i(TAG, "下载被取消: $displayName")
+                    throw kotlinx.coroutines.CancellationException("下载已取消")
+                }
                 Log.i(TAG, "下载完成: $displayName, 大小 ${archiveFile.length()} bytes, 路径: ${archiveFile.absolutePath}")
 
                 emitProgress(scope, EngineProgress(EngineProgress.Phase.VERIFYING))
@@ -503,13 +637,20 @@ class EnginePackManager @Inject constructor(
                     Log.w(TAG, "manifest 未提供 $displayName 的 sha256，跳过校验")
                 }
                 break
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                archiveFile.delete()
+                throw e
             } catch (e: Exception) {
                 archiveFile.delete()
-                if (attempt < MAX_DOWNLOAD_ATTEMPTS) {
-                    Log.w(TAG, "第 $attempt 次尝试失败: ${e.message}, 将重试", e)
-                    continue
+                // 用户取消下载（okhttp 中断抛 IOException 等）→ 统一转 CancellationException 供上层识别
+                if (cancelRequested) {
+                    throw kotlinx.coroutines.CancellationException("下载已取消")
                 }
-                throw e
+                if (attempt >= MAX_DOWNLOAD_ATTEMPTS) {
+                    throw e
+                }
+                Log.w(TAG, "第 $attempt 次尝试失败: ${e.message}, 将重试", e)
+                continue
             }
         }
 

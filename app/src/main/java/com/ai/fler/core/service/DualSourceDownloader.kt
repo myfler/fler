@@ -4,6 +4,7 @@ import android.util.Log
 import com.ai.fler.core.log.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
@@ -28,6 +29,17 @@ class DualSourceDownloader @Inject constructor(
 ) {
     companion object {
         private const val TAG = "FlerEngine"
+    }
+
+    /** 当前活动下载 Call（取消下载用）。 */
+    @Volatile
+    private var activeCall: Call? = null
+
+    /**
+     * 取消当前下载（中断 okhttp Call 的阻塞 IO）。
+     */
+    fun cancel() {
+        activeCall?.cancel()
     }
 
     /**
@@ -57,6 +69,9 @@ class DualSourceDownloader @Inject constructor(
                 Log.i(TAG, "下载源成功: $cand")
                 appLogger.info(TAG, "下载源成功: $cand")
                 return@withContext target
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 用户取消下载 → 不切换下一候选源，直接终止
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "下载源失败: $cand, 原因: ${e.message}", e)
                 appLogger.error(TAG, "下载源失败: $cand, 原因: ${e.message}")
@@ -161,47 +176,59 @@ class DualSourceDownloader @Inject constructor(
             .header("User-Agent", "Fler/1.0")
             .build()
 
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw HttpException(response.code, "HTTP ${response.code}")
-            }
+        val call = okHttpClient.newCall(request)
+        activeCall = call
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw HttpException(response.code, "HTTP ${response.code}")
+                }
 
-            val body = response.body ?: throw IllegalStateException("空响应体")
-            val totalBytes = body.contentLength()
-            Log.i(TAG, "HTTP ${response.code}, Content-Length: $totalBytes bytes, url=$url")
-            val inputStream = body.byteStream()
-            val outputStream = FileOutputStream(target)
+                val body = response.body ?: throw IllegalStateException("空响应体")
+                val totalBytes = body.contentLength()
+                Log.i(TAG, "HTTP ${response.code}, Content-Length: $totalBytes bytes, url=$url")
+                val inputStream = body.byteStream()
+                val outputStream = FileOutputStream(target)
 
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var downloaded = 0L
-            var lastTime = System.currentTimeMillis()
-            var lastDownloaded = 0L
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var downloaded = 0L
+                var lastTime = System.currentTimeMillis()
+                var lastDownloaded = 0L
 
-            inputStream.use { input ->
-                outputStream.use { output ->
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        output.write(buffer, 0, read)
-                        downloaded += read
+                inputStream.use { input ->
+                    outputStream.use { output ->
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read == -1) break
+                            output.write(buffer, 0, read)
+                            downloaded += read
 
-                        // 每 500ms 报告一次进度
-                        val now = System.currentTimeMillis()
-                        if (now - lastTime >= 500) {
-                            val elapsed = (now - lastTime) / 1000.0
-                            val delta = downloaded - lastDownloaded
-                            val speed = if (elapsed > 0) {
-                                formatSpeed(delta / elapsed)
-                            } else "-- KB/s"
-                            onProgress(downloaded, totalBytes, speed)
-                            lastTime = now
-                            lastDownloaded = downloaded
+                            // 每 500ms 报告一次进度
+                            val now = System.currentTimeMillis()
+                            if (now - lastTime >= 500) {
+                                val elapsed = (now - lastTime) / 1000.0
+                                val delta = downloaded - lastDownloaded
+                                val speed = if (elapsed > 0) {
+                                    formatSpeed(delta / elapsed)
+                                } else "-- KB/s"
+                                onProgress(downloaded, totalBytes, speed)
+                                lastTime = now
+                                lastDownloaded = downloaded
+                            }
                         }
                     }
                 }
-            }
 
-            onProgress(downloaded, totalBytes, formatSpeed(0.0))
+                onProgress(downloaded, totalBytes, formatSpeed(0.0))
+            }
+        } catch (e: Exception) {
+            // 主动取消（call.cancel()）→ 统一转 CancellationException，上层不切换下一源
+            if (call.isCanceled()) {
+                throw kotlinx.coroutines.CancellationException("下载已取消")
+            }
+            throw e
+        } finally {
+            if (activeCall === call) activeCall = null
         }
     }
 
