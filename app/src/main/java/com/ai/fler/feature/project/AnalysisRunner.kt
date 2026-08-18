@@ -476,7 +476,7 @@ class AnalysisRunner @Inject constructor(
      * 产物目录结构：
      *   outDir/pp.txt、objs.txt、asm 目录、ida_script 目录、blutter_frida.js
      *
-     * zip 命名：blutter_products_&lt;analysisId&gt;.zip，放在工作目录根；未设置工作目录则跳过（产物仍在缓存）。
+     * zip 命名：blutter_products_&lt;项目名&gt;_&lt;analysisId&gt;.zip，放在工作目录根；未设置工作目录则跳过（产物仍在缓存）。
      */
     private suspend fun archiveAndExportProducts(
         projectId: Long,
@@ -489,7 +489,8 @@ class AnalysisRunner @Inject constructor(
             val topFiles = dir.listFiles()?.filter { it.isFile } ?: emptyList()
             val subDirs = dir.listFiles()?.filter { it.isDirectory } ?: emptyList()
             if (topFiles.isEmpty() && subDirs.isEmpty()) return@withContext
-            val zipFile = File(dir, "blutter_products_$analysisId.zip")
+            val projectName = projectDao.getById(projectId)?.name?.replace(Regex("[\\\\/:*?\"<>|]"), "_") ?: "unknown"
+            val zipFile = File(dir, "blutter_products_${projectName}_$analysisId.zip")
             try {
                 ZipOutputStream(FileOutputStream(zipFile)).use { zip ->
                     // 顶层文件（pp.txt / objs.txt / blutter_frida.js 等）

@@ -20,11 +20,15 @@ description: 分析目标 App 的单个 Dart 方法（逻辑、调用关系、�
    - 知道类名：`get_class(className=类名)` 或 `list_methods(name=方法名子串)`。
    - 不知道类：`list_methods(name=关键词)` 按子串过滤。
    - 拿到的 `functionOffset` 是 vaddr；改文件需 `fileOffset`（已换算返回）。
-3. **一站式读取**
-   - `analyze_method(methodName=类.方法)`：一次拿 src_code（截断）+ callers + callees + PP 引用。
+   - 混淆包的匿名闭包先 `closure_map(vaddr=…)` 或 `closure_map(query=业务词)` 定位归属类；`resolve_entry(vaddr=functionOffset)` 把对象池槽 vaddr 还原成真实代码入口。
+3. **一站式读取（双轨反汇编）**
+   - `analyze_method(methodName=类.方法)`：一次拿 src_code（截断）+ **asmCode/asmUrl/asmSize（asm_blocks 标准 DumpCode）** + callers + callees + PP 引用。
+   - `src_code` 是 fler 兼容格式（`// 0x…: IL语义` + 裸指令）；`asmCode` 是引擎直写 `asm_blocks` 表的标准 DumpCode（`    // ` 缩进 + `; [pp+…]` 解引用），两者互补。
+   - src_code 空壳但想读反汇编：`get_asm_code(methodId=… 或 name=…)` 拿 asm_blocks 完整存档（默认截断，`includeBody=true` 看全文）。
    - 若 src 截断且想看完：`get_method(methodId=…, includeSrc=true)`（谨慎，字段很大）。
+   - 空壳方法（`functionSize=0`）：两轨都空，改走机器码链路（`string_xrefs`/`scan_pool_refs`/`method_cfg`）。
 4. **深挖依赖**
-   - 关心的调用方：`get_method_callers(methodName=…)`（图未建好时 `dart_call_graph_status` 看进度）。
+   - 关心的调用方：`get_method_callers(methodName=…)`（图未建好时 `dart_call_graph_status` 看进度；需强制重建用 `dart_rebuild_call_graph`）。
    - 关心 PP 数据：`get_pp_entry(ppOffset=…)` 查对象池条目描述。
    - 关心字符串：`search_strings(query=关键词)`。
    - 若方法名/类名被混淆（`<unknown>`/`<anonymous closure>`），改用结构扫描反混淆：
@@ -32,6 +36,7 @@ description: 分析目标 App 的单个 Dart 方法（逻辑、调用关系、�
      - 看类引用了哪些字符串：`infer_class_fields(className=…)`。
      - 按字符串反查方法：`string_xrefs(query=…)` 或 `scan_pool_refs(ppOffsets=0x…)`（无字符串槽时直传已知槽偏移，来自 calibrate 的 poolLoads）。
      - 找布尔 getter 候选：`find_bool_getters(query=…)`；候选落补丁位用 `getter_return_shape(methodId=…)`。
+     - 混淆方法控制流：`method_cfg(methodId=…)` 划基本块找所有返回点；`blr_call_sites(methodId=…)` 看间接跳转形态（isolate 属正常，静态不可解析）。
    - 字符串可能走 fallback：`list_strings` 返回非 0（甚至几万条）即 fallback 生效（未建 strings 表时从 pp_entries 挑引号字符串），别误判无字符串。
 5. **反汇编原始字节/确认指令**：`disassemble_range(soPath=…, offset=fileOffset, size=…, compact=true)`；或用引擎会话 `engine_open` → `engine_disassemble`/`engine_read_bytes`（Dart 库函数定位优先 `engine_find_function_at`）。
 6. **改补丁**（用户明确要求才做）：`read_so_bytes` → `assemble_instruction` 预览 → 向用户确认 → `patch_bytes`/`patch_instruction` → `export_patched_so`，并给出 `http://<host>:<port>/export/<文件名>` 下载地址。

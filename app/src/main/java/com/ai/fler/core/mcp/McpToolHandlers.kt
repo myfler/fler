@@ -196,8 +196,14 @@ class McpToolHandlers @Inject constructor(
 
     // ========== 参数读取辅助 ==========
 
-    private fun JsonObject.long(key: String): Long? =
-        (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+    private fun JsonObject.long(key: String): Long? {
+        val v = (this[key] as? JsonPrimitive)?.contentOrNull ?: return null
+        return if (v.startsWith("0x", ignoreCase = true)) {
+            v.substring(2).toLongOrNull(16)
+        } else {
+            v.toLongOrNull()
+        }
+    }
 
     private fun JsonObject.int(key: String): Int? =
         (this[key] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
