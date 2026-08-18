@@ -3,6 +3,7 @@ package com.ai.fler.feature.output
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.ai.fler.data.dao.AsmBlockDao
 import com.ai.fler.data.dao.DartMethodDao
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -16,13 +17,14 @@ import javax.inject.Inject
 /**
  * ASM 浏览器 ViewModel。
  *
- * 从 Blutter 分析导入的 dart_methods.src_code（反汇编伪代码）加载内容，
- * 替代早期基于 asm 文件的实现（新引擎直接写 SQLite，不再生成 asm 文件）。
+ * 优先加载 dart_methods.src_code（反汇编伪代码）；空壳方法（src_code 仅占位/空）
+ * 回退到 asm_blocks 完整反汇编（标准 DumpCode 格式，含语义注释）。
  */
 @HiltViewModel
 class AsmBrowserViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
-    private val dartMethodDao: DartMethodDao
+    private val dartMethodDao: DartMethodDao,
+    private val asmBlockDao: AsmBlockDao
 ) : ViewModel() {
 
     private val analysisId: Long = savedStateHandle["analysisId"] ?: 0L
@@ -46,7 +48,12 @@ class AsmBrowserViewModel @Inject constructor(
                 val result = withContext(Dispatchers.IO) {
                     dartMethodDao.getById(methodId)?.let { method ->
                         val src = method.srcCode ?: ""
-                        val lines = src.split("\n").filter { it.isNotEmpty() }
+                        // 空壳/占位（src_code 为空或只是方法名回声）时回退 asm_blocks
+                        val body = if (src.isBlank()) {
+                            asmBlockDao.getByMethodId(analysisId, methodId)?.body
+                        } else null
+                        val content = body ?: src
+                        val lines = content.split("\n").filter { it.isNotEmpty() }
                         Triple(
                             method.methodName,
                             lines,

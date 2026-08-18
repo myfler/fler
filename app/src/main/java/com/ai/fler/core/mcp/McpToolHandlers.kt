@@ -19,6 +19,7 @@ import com.ai.fler.core.jni.KeystoneBindings
 import com.ai.fler.core.service.AddressTranslator
 import com.ai.fler.core.service.WorkDirectory
 import com.ai.fler.data.dao.AnalysisDao
+import com.ai.fler.data.dao.AsmBlockDao
 import com.ai.fler.data.entity.Analysis
 import com.ai.fler.data.dao.DartCallGraphDao
 import com.ai.fler.data.dao.DartClassDao
@@ -60,6 +61,7 @@ class McpToolHandlers @Inject constructor(
     private val dartClassDao: DartClassDao,
     private val dartMethodDao: DartMethodDao,
     private val ppEntryDao: PpEntryDao,
+    private val asmBlockDao: AsmBlockDao,
     private val dartObjectDao: DartObjectDao,
     private val enumMapDao: EnumMapDao,
     private val projectDao: ProjectDao,
@@ -194,8 +196,14 @@ class McpToolHandlers @Inject constructor(
 
     // ========== 参数读取辅助 ==========
 
-    private fun JsonObject.long(key: String): Long? =
-        (this[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+    private fun JsonObject.long(key: String): Long? {
+        val v = (this[key] as? JsonPrimitive)?.contentOrNull ?: return null
+        return if (v.startsWith("0x", ignoreCase = true)) {
+            v.substring(2).toLongOrNull(16)
+        } else {
+            v.toLongOrNull()
+        }
+    }
 
     private fun JsonObject.int(key: String): Int? =
         (this[key] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()
@@ -580,6 +588,10 @@ class McpToolHandlers @Inject constructor(
             val src = m.srcCode ?: ""
             val capped = if (!full && src.length > MAX_SRC) src.take(MAX_SRC) else src
             val soPath = libAppPath(id)
+            // asm_blocks 存档（标准 DumpCode 格式）：src_code 为空壳占位（等于方法名）
+            // 时回退取 asm 完整反汇编，保证空壳方法也能读到语义注释版
+            val block = asmBlockDao.getByMethodId(id, m.id)
+            val asmCode = block?.body?.takeIf { it.isNotBlank() }
             buildJsonObject {
                 put("found", true)
                 put("id", m.id)
@@ -592,10 +604,65 @@ class McpToolHandlers @Inject constructor(
                 put("functionSize", m.functionSize ?: 0)
                 put("srcTruncated", !full && src.length > MAX_SRC)
                 put("srcCode", capped)
+put("asmCode", if (full) asmCode else asmCode?.take(MAX_SRC))
+                put("asmUrl", block?.url)
+                put("asmSize", block?.size ?: 0)
             }
         },
         McpTool(
-name = "get_pp_entry",
+            name = "get_asm_code",
+            description = "获取某方法的 asm_blocks 完整反汇编存档（引擎直写表，标准 DumpCode 格式，含 IL 语义注释 + pp 解引用）。与 get_method 的 src_code（裸指令）互补；src_code 为空壳时 asm_blocks 是唯一可读反汇编。定位方式同 get_method：methodId 或 name（精确，支持 sub_<vaddr>）。返回 JSON：vaddr/size/url/body + 关联方法元数据；无块时返回 found=false。analysisId 可省略（缺省 use_analysis）",
+            inputSchema = buildJsonObject {
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("analysisId") { put("type", "integer"); put("description", "分析记录 ID（可选，缺省用 use_analysis 设定的当前分析）") }
+                    putJsonObject("methodId") { put("type", "integer"); put("description", "方法 ID（来自 list_methods）；与 name 二选一") }
+                    putJsonObject("name") { put("type", "string"); put("description", "方法名精确匹配（如 EZa::_anon_closure_13141c4）；与 methodId 二选一") }
+                    putJsonObject("includeBody") { put("type", "boolean"); put("description", "true=返回完整 body（默认截断）") }
+                }
+            }
+        ) { p ->
+            val id = resolveAnalysisId(p, "get_asm_code")
+            val methodId = p.long("methodId")
+            val name = p.str("name")
+            val full = p.str("includeBody") == "true"
+            val match = when {
+                methodId != null -> dartMethodDao.getMethodWithClassById(methodId)
+                name != null -> {
+                    val subVaddr = DartNameDisplay.parseSubName(name)
+                    if (subVaddr != null) dartMethodDao.getMethodWithClassByOffset(id, subVaddr)
+                    else dartMethodDao.getMethodWithClassByName(id, name)
+                        ?: dartMethodDao.searchMethodsWithClass(id, name, null, 1, 0).firstOrNull()
+                }
+                else -> null
+            }
+            val block = if (match != null) {
+                asmBlockDao.getByMethodId(id, match.method.id)
+                    ?: asmBlockDao.getByVaddr(id, match.method.functionOffset ?: 0)
+            } else null
+            if (block == null) {
+                return@McpTool buildJsonObject {
+                    put("found", false)
+                    put("reason", if (match == null) "method not found" else "no asm_block for this method (empty shell / engine had no disassembly)")
+                }
+            }
+            val body = block.body
+            val cappedBody = if (!full && body.length > MAX_SRC) body.take(MAX_SRC) else body
+            buildJsonObject {
+                put("found", true)
+                put("vaddr", block.vaddr)
+                put("size", block.size)
+                put("url", block.url)
+                put("bodyTruncated", !full && body.length > MAX_SRC)
+                put("body", cappedBody)
+                put("methodId", block.methodId)
+                put("className", match?._className)
+                put("methodName", match?.method?.methodName)
+                put("functionOffset", match?.method?.functionOffset ?: 0)
+            }
+        },
+        McpTool(
+            name = "get_pp_entry",
             description = "按 pp 偏移（vmOffset）查 Dart 对象池条目：type/description（可读描述）/fileOffset/引用它的方法数。用途：确认 search_strings / find_bool_getters 拿到的槽是否为目标（如字符串/字段/stub），并作为 scan_pool_refs 的目标槽输入。混淆包的槽描述常为 Field/Stub 形态（如 'static late'），字符串槽 type 为 String。支持两种定位：1) ppOffset 精确查槽；2) query 按 description/type 内容子串反查（不区分大小写）——用于表无记录但代码有引用（如 .rodata 业务串）时先按内容找到槽。analysisId 可省略（缺省 use_analysis）。ppOffset 支持十进制或 0x 十六进制",
             inputSchema = buildJsonObject {
                 put("type", "object")
@@ -999,6 +1066,10 @@ name = "get_pp_entry",
             // 图未就绪时静默触发建图，但本次不阻塞等待
             if (!graphBuilt) ensureGraph(id)
 
+            // asm_blocks 存档（标准 DumpCode 格式）：src_code 空壳时回退补充
+            val block = asmBlockDao.getByMethodId(id, m.id)
+            val asmCode = block?.body?.takeIf { it.isNotBlank() }
+
             // 只取 src 中确实出现的 [pp+0x..] 偏移，避免全库模糊匹配
             val ppOffsets = Regex("\\[pp\\+0x([0-9a-fA-F]+)\\]")
                 .findAll(capped)
@@ -1043,6 +1114,9 @@ name = "get_pp_entry",
                 put("functionSize", m.functionSize ?: 0)
                 put("srcTruncated", !full && src.length > MAX_SRC)
                 put("srcCode", capped)
+                put("asmCode", if (full) asmCode else asmCode?.take(MAX_SRC))
+                put("asmUrl", block?.url)
+                put("asmSize", block?.size ?: 0)
                 put("graphSource", "DART_CALL_GRAPH")
                 put("graphBuilt", graphBuilt)
                 put("edgeCount", edgeCount)

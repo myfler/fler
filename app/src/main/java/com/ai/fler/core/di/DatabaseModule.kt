@@ -7,6 +7,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.ai.fler.data.AppDatabase
 import com.ai.fler.data.dao.AddressMappingDao
 import com.ai.fler.data.dao.AnalysisDao
+import com.ai.fler.data.dao.AsmBlockDao
 import com.ai.fler.data.dao.DartCallGraphDao
 import com.ai.fler.data.dao.DartClassDao
 import com.ai.fler.data.dao.DartMethodDao
@@ -45,7 +46,7 @@ object DatabaseModule {
         )
             .addMigrations(
                 MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
-                MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10
+                MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11
             )
             .fallbackToDestructiveMigration()
             .build()
@@ -197,10 +198,38 @@ object DatabaseModule {
         }
     }
 
-    @Provides
-    fun provideProjectDao(db: AppDatabase): ProjectDao = db.projectDao()
+    /** 10 → 11：新增 asm_blocks（Blutter asm 完整反汇编导入表）。 */
+    private val MIGRATION_10_11 = object : Migration(10, 11) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `asm_blocks` (" +
+                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`analysis_id` INTEGER NOT NULL, " +
+                    "`method_id` INTEGER NOT NULL, " +
+                    "`vaddr` INTEGER NOT NULL, " +
+                    "`size` INTEGER NOT NULL, " +
+                    "`url` TEXT, " +
+                    "`body` TEXT NOT NULL, " +
+                    "FOREIGN KEY(`analysis_id`) REFERENCES `analyses`(`id`) " +
+                    "ON UPDATE NO ACTION ON DELETE CASCADE, " +
+                    "FOREIGN KEY(`method_id`) REFERENCES `dart_methods`(`id`) " +
+                    "ON UPDATE NO ACTION ON DELETE CASCADE" +
+                    ")"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_asm_blocks_analysis_id` ON `asm_blocks` (`analysis_id`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_asm_blocks_method_id` ON `asm_blocks` (`method_id`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_asm_blocks_analysis_id_vaddr` ON `asm_blocks` (`analysis_id`, `vaddr`)"
+            )
+        }
+    }
 
     @Provides
+    fun provideProjectDao(db: AppDatabase): ProjectDao = db.projectDao()    @Provides
     fun provideAnalysisDao(db: AppDatabase): AnalysisDao = db.analysisDao()
 
     @Provides
@@ -232,4 +261,7 @@ object DatabaseModule {
 
     @Provides
     fun provideEnumMapDao(db: AppDatabase): EnumMapDao = db.enumMapDao()
+
+    @Provides
+    fun provideAsmBlockDao(db: AppDatabase): AsmBlockDao = db.asmBlockDao()
 }
